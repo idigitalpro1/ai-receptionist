@@ -3,6 +3,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.set('trust proxy', true);
@@ -14,6 +15,7 @@ const claude = process.env.ANTHROPIC_API_KEY
   : null;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const XAI_MODEL = process.env.XAI_MODEL || 'grok-4.5';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const SIP_DOMAIN = process.env.SIP_DOMAIN || '1722.3cx.cloud';
@@ -22,8 +24,178 @@ const GREETING_AUDIO_FILE = process.env.GREETING_AUDIO_FILE || 'main-line-greeti
 const ASSETS_DIR = path.join(__dirname, 'assets');
 const GREETING_AUDIO_PATH = path.join(ASSETS_DIR, GREETING_AUDIO_FILE);
 const HAS_GREETING_AUDIO = fs.existsSync(GREETING_AUDIO_PATH);
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const CHAT_MAX_MESSAGE_LENGTH = Number(process.env.CHAT_MAX_MESSAGE_LENGTH || 1200);
+const CHAT_MAX_HISTORY_ITEMS = Number(process.env.CHAT_MAX_HISTORY_ITEMS || 12);
+const CHAT_ALLOWED_ORIGINS = String(process.env.CHAT_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const AILEEN_KNOWLEDGE = String(process.env.AILEEN_KNOWLEDGE || '').trim();
+const CHAT_RATE_LIMIT = Number(process.env.CHAT_RATE_LIMIT || 20);
+const CHAT_RATE_WINDOW_MS = Number(process.env.CHAT_RATE_WINDOW_MS || 60_000);
+const MESSAGE_DELIVERY_ENABLED = process.env.MESSAGE_DELIVERY_ENABLED === 'true';
+const chatRateBuckets = new Map();
+
+const AILEEN_SYSTEM_PROMPT = `You are Aileen, the intelligent front door to Colorado News Press and its network of community publications, including the Weekly Register-Call, Colorado's oldest continuously published newspaper.
+
+You are warm, capable, calm, sharp, respectful, community-minded, helpful, and efficient.
+
+You are not chatty, salesy, argumentative, defensive, overly casual, political, judgmental, or robotic.
+
+Your job is to:
+- Welcome visitors
+- Answer common questions about the newspapers, digital sites, public notices, advertising, subscriptions, events, and archives
+- Capture concise contact details and messages when a configured staff follow-up channel is available
+- Identify advertising and subscription inquiries
+- Direct people to the right published person or resource
+- End every interaction with one clear outcome
+
+Boundaries — never:
+- Reveal private mobile numbers or personal addresses
+- Confirm unpublished stories or confidential sources
+- Promise coverage, publication, refunds, corrections, response times, or outcomes
+- Give legal advice or make legal conclusions
+- Make political endorsements
+- Invent company policy, pricing, deadlines, staff availability, or contact information
+- Discuss private financial information
+
+Use only facts supplied in the conversation or the verified organization notes below. If the answer is not supplied, say you do not know. Ask one concise follow-up question or direct the visitor to a published contact if one is provided. Do not claim a message was delivered unless the application confirms delivery.
+
+Message delivery capability: ${MESSAGE_DELIVERY_ENABLED ? 'enabled' : 'disabled'}.
+When message delivery is disabled, do not collect personal contact details and do not say you can pass, send, forward, or deliver a message. State clearly that message delivery is not configured, then offer a verified published contact if one appears in the organization notes.
+
+Tone: professional but human. Short sentences. No filler. Respect the history and the communities you serve.
+
+You represent a growing Colorado media network that values trusted local journalism and personal service.
+
+Verified organization notes:
+${AILEEN_KNOWLEDGE || 'No additional organization facts have been configured.'}`;
 
 app.use('/audio', express.static(ASSETS_DIR));
+app.use('/aileen', express.static(PUBLIC_DIR));
+
+function isAllowedChatOrigin(req) {
+  const origin = req.get('origin');
+  if (!origin) return true;
+  return CHAT_ALLOWED_ORIGINS.includes(origin);
+}
+
+function setChatCors(req, res) {
+  const origin = req.get('origin');
+  if (origin && CHAT_ALLOWED_ORIGINS.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Vary', 'Origin');
+  }
+}
+
+function normalizeChatHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .slice(-CHAT_MAX_HISTORY_ITEMS)
+    .filter((item) => item && ['user', 'assistant'].includes(item.role))
+    .map((item) => ({
+      role: item.role,
+      content: String(item.content || '').slice(0, CHAT_MAX_MESSAGE_LENGTH)
+    }))
+    .filter((item) => item.content.trim());
+}
+
+function isWithinChatRateLimit(req) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const bucket = chatRateBuckets.get(key);
+
+  if (!bucket || now >= bucket.resetAt) {
+    chatRateBuckets.set(key, { count: 1, resetAt: now + CHAT_RATE_WINDOW_MS });
+    return true;
+  }
+
+  bucket.count += 1;
+  return bucket.count <= CHAT_RATE_LIMIT;
+}
+
+async function createAileenReply(history) {
+  if (process.env.XAI_API_KEY) {
+    const response = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.XAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: XAI_MODEL,
+        temperature: 0.3,
+        max_tokens: 350,
+        messages: [
+          { role: 'system', content: AILEEN_SYSTEM_PROMPT },
+          ...history
+        ]
+      })
+    });
+    if (!response.ok) throw new Error(`xAI chat failed: ${response.status}`);
+    const data = await response.json();
+    return String(data?.choices?.[0]?.message?.content || '').trim();
+  }
+
+  if (process.env.OPENAI_API_KEY) {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.3,
+        max_tokens: 350,
+        messages: [
+          { role: 'system', content: AILEEN_SYSTEM_PROMPT },
+          ...history
+        ]
+      })
+    });
+    if (!response.ok) throw new Error(`OpenAI chat failed: ${response.status}`);
+    const data = await response.json();
+    return String(data?.choices?.[0]?.message?.content || '').trim();
+  }
+
+  if (process.env.GEMINI_API_KEY) {
+    const transcript = history
+      .map((item) => `${item.role === 'assistant' ? 'Aileen' : 'Visitor'}: ${item.content}`)
+      .join('\n');
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: AILEEN_SYSTEM_PROMPT }] },
+          generationConfig: { maxOutputTokens: 350, temperature: 0.3 },
+          contents: [{ role: 'user', parts: [{ text: transcript }] }]
+        })
+      }
+    );
+    if (!response.ok) throw new Error(`Gemini chat failed: ${response.status}`);
+    const data = await response.json();
+    return String(
+      data?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join(' ') || ''
+    ).trim();
+  }
+
+  if (claude) {
+    const msg = await claude.messages.create({
+      model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5',
+      system: AILEEN_SYSTEM_PROMPT,
+      max_tokens: 350,
+      temperature: 0.3,
+      messages: history
+    });
+    return String(msg.content?.map((part) => part.text || '').join(' ') || '').trim();
+  }
+
+  throw new Error('No AI provider is configured');
+}
 
 const EXTENSIONS = {
   '17410': 'Patrick Sweeney, Publisher',
@@ -246,6 +418,56 @@ app.post('/route', async (req, res) => {
   }
 });
 
+app.options('/chat', (req, res) => {
+  if (!isAllowedChatOrigin(req)) return res.sendStatus(403);
+  setChatCors(req, res);
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  return res.sendStatus(204);
+});
+
+app.post('/chat', async (req, res) => {
+  const requestId = crypto.randomUUID();
+  setChatCors(req, res);
+
+  if (!isAllowedChatOrigin(req)) {
+    return res.status(403).json({ error: 'This site is not authorized to use Aileen.' });
+  }
+  if (!isWithinChatRateLimit(req)) {
+    return res.status(429).json({
+      error: 'Aileen has received too many requests. Please wait a moment and try again.',
+      requestId
+    });
+  }
+
+  const message = String(req.body?.message || '').trim();
+  if (!message) return res.status(400).json({ error: 'Please enter a message.' });
+  if (message.length > CHAT_MAX_MESSAGE_LENGTH) {
+    return res.status(400).json({ error: 'That message is too long. Please shorten it.' });
+  }
+
+  const history = normalizeChatHistory(req.body?.history);
+  if (!history.length || history.at(-1)?.content !== message) {
+    history.push({ role: 'user', content: message });
+  }
+
+  try {
+    const reply = await createAileenReply(history);
+    if (!reply) throw new Error('AI provider returned an empty response');
+    return res.json({ reply, requestId });
+  } catch (error) {
+    console.error(`[chat:${requestId}] ${error.message}`);
+    return res.status(503).json({
+      error: 'Aileen is temporarily unavailable. Please try again shortly.',
+      requestId
+    });
+  }
+});
+
+app.get('/aileen-demo', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -254,6 +476,13 @@ app.get('/health', (req, res) => {
     port: PORT,
     greetingAudioLoaded: HAS_GREETING_AUDIO,
     greetingAudioFile: GREETING_AUDIO_FILE,
+    chatEnabled: Boolean(
+      process.env.XAI_API_KEY ||
+      process.env.OPENAI_API_KEY ||
+      process.env.GEMINI_API_KEY ||
+      process.env.ANTHROPIC_API_KEY
+    ),
+    messageDeliveryEnabled: MESSAGE_DELIVERY_ENABLED,
     time: new Date().toISOString()
   });
 });
