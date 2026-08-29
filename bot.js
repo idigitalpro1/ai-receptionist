@@ -35,7 +35,10 @@ const AILEEN_KNOWLEDGE = String(process.env.AILEEN_KNOWLEDGE || '').trim();
 const CHAT_RATE_LIMIT = Number(process.env.CHAT_RATE_LIMIT || 20);
 const CHAT_RATE_WINDOW_MS = Number(process.env.CHAT_RATE_WINDOW_MS || 60_000);
 const MESSAGE_DELIVERY_ENABLED = process.env.MESSAGE_DELIVERY_ENABLED === 'true';
+const PATRICK_IPHONE_NUMBER = '+17204533534';
+const IPHONE_SPEECH_RE = /\b(100|one hundred|extension\s*100)\b/i;
 const chatRateBuckets = new Map();
+const voicemailDrafts = new Map();
 
 const AILEEN_SYSTEM_PROMPT = `You are Aileen, the intelligent front door to Colorado News Press and its network of community publications, including the Weekly Register-Call, Colorado's oldest continuously published newspaper.
 
@@ -313,7 +316,30 @@ function buildDecision(extension, reason) {
   };
 }
 
+function buildIphoneDecision(reason) {
+  return {
+    action: 'dial_pstn',
+    extension: '100',
+    number: PATRICK_IPHONE_NUMBER,
+    department: 'Patrick Sweeney',
+    reason
+  };
+}
+
+function isIphoneRequest({ input = '', speech = '', dtmf = '' }) {
+  const digit = String(dtmf || '').trim();
+  if (digit === '100') return 'dtmf:100';
+  const transcript = String(speech || input || '').trim();
+  if (transcript && IPHONE_SPEECH_RE.test(transcript)) return 'speech:100';
+  return null;
+}
+
 async function resolveDecision({ input = '', speech = '', dtmf = '' }) {
+  const iphoneReason = isIphoneRequest({ input, speech, dtmf });
+  if (iphoneReason) {
+    return buildIphoneDecision(iphoneReason);
+  }
+
   const digit = String(dtmf || '').trim();
   if (digit && DTMF_MAP[digit]) {
     return buildDecision(DTMF_MAP[digit], `dtmf:${digit}`);
@@ -333,9 +359,85 @@ function respondWithTwiml(res, decision, message) {
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna' }, message);
 
-  twiml.dial().sip(`sip:${decision.extension}@${SIP_DOMAIN}`);
+  if (decision.action === 'dial_pstn' && decision.number) {
+    const dial = twiml.dial({
+      action: '/iphone-dial-status',
+      method: 'POST',
+      timeout: 24
+    });
+    dial.number(decision.number);
+  } else {
+    twiml.dial().sip(`sip:${decision.extension}@${SIP_DOMAIN}`);
+  }
 
   res.type('text/xml').send(twiml.toString());
+}
+
+function getVoicemailDraft(req) {
+  const callSid = String(req.body?.CallSid || 'unknown');
+  if (!voicemailDrafts.has(callSid)) {
+    voicemailDrafts.set(callSid, {
+      callSid,
+      from: String(req.body?.From || ''),
+      name: '',
+      callback: '',
+      message: '',
+      transcript: [],
+      createdAt: new Date().toISOString()
+    });
+  }
+  return voicemailDrafts.get(callSid);
+}
+
+function appendTranscript(draft, step, req) {
+  const spoken = String(req.body?.SpeechResult || '').trim();
+  const digits = String(req.body?.Digits || '').trim();
+  const text = spoken || digits;
+  if (text) {
+    draft.transcript.push({ step, text, spoken, digits });
+  }
+  return text;
+}
+
+function sendTwiml(res, twiml) {
+  res.type('text/xml').send(twiml.toString());
+}
+
+function gatherSpeech(twiml, action, prompt, extras = {}) {
+  const gather = twiml.gather({
+    input: extras.input || 'speech',
+    action,
+    method: 'POST',
+    speechTimeout: 'auto',
+    language: 'en-US',
+    timeout: extras.timeout || 8,
+    finishOnKey: extras.finishOnKey || '#'
+  });
+  gather.say({ voice: 'Polly.Joanna' }, prompt);
+  twiml.redirect(action);
+}
+
+async function persistVoicemail(draft, status) {
+  const payload = {
+    ...draft,
+    status,
+    savedAt: new Date().toISOString()
+  };
+  console.log(`[voicemail] ${JSON.stringify(payload)}`);
+
+  const webhook = String(process.env.MESSAGE_DELIVERY_WEBHOOK || '').trim();
+  if (MESSAGE_DELIVERY_ENABLED && webhook) {
+    try {
+      const response = await fetch(webhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      console.log(`[voicemail] delivery webhook status=${response.status} callSid=${draft.callSid}`);
+    } catch (error) {
+      console.error(`[voicemail] delivery webhook failed callSid=${draft.callSid} ${error.message}`);
+    }
+  }
 }
 
 function respondWithFallback(res, message) {
@@ -389,10 +491,14 @@ app.post('/route', async (req, res) => {
     const dtmf = req.body?.Digits || req.body?.dtmf || '';
     const decision = await resolveDecision({ input, speech, dtmf });
 
-    console.log(`[route] input="${input || speech}" dtmf="${dtmf}" -> ${decision.extension}`);
+    console.log(`[route] input="${input || speech}" dtmf="${dtmf}" -> ${decision.action}:${decision.extension}${decision.number ? ' ' + decision.number : ''}`);
 
     if (isJsonRoute) {
       return res.json(decision);
+    }
+
+    if (decision.action === 'dial_pstn') {
+      return respondWithTwiml(res, decision, 'One moment, connecting you now.');
     }
 
     const label = EXTENSIONS[decision.extension] || 'our general desk';
@@ -466,6 +572,73 @@ app.post('/chat', async (req, res) => {
 
 app.get('/aileen-demo', (_req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+
+app.post('/iphone-dial-status', (req, res) => {
+  const status = String(req.body?.DialCallStatus || '').toLowerCase();
+  const callSid = String(req.body?.CallSid || 'unknown');
+  console.log(`[iphone] dial status=${status} callSid=${callSid}`);
+
+  if (status === 'completed' || status === 'answered') {
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.hangup();
+    return sendTwiml(res, twiml);
+  }
+
+  const draft = getVoicemailDraft(req);
+  draft.dialStatus = status;
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say({ voice: 'Polly.Joanna' }, 'I am sorry, that line is unavailable. I can take a message.');
+  gatherSpeech(twiml, '/voicemail-name', 'Please say your name.');
+  return sendTwiml(res, twiml);
+});
+
+app.post('/voicemail-name', async (req, res) => {
+  const draft = getVoicemailDraft(req);
+  const text = appendTranscript(draft, 'name', req);
+  if (text) draft.name = text;
+  await persistVoicemail(draft, 'partial-name');
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  gatherSpeech(
+    twiml,
+    '/voicemail-callback',
+    'Please say or enter your callback number.',
+    { input: 'speech dtmf', timeout: 12 }
+  );
+  return sendTwiml(res, twiml);
+});
+
+app.post('/voicemail-callback', async (req, res) => {
+  const draft = getVoicemailDraft(req);
+  const text = appendTranscript(draft, 'callback', req);
+  if (text) draft.callback = text;
+  await persistVoicemail(draft, 'partial-callback');
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  gatherSpeech(
+    twiml,
+    '/voicemail-body',
+    'Please leave a brief message after the tone.'
+  );
+  return sendTwiml(res, twiml);
+});
+
+app.post('/voicemail-body', async (req, res) => {
+  const draft = getVoicemailDraft(req);
+  const text = appendTranscript(draft, 'message', req);
+  if (text) draft.message = text;
+
+  await persistVoicemail(draft, 'recorded');
+  voicemailDrafts.delete(draft.callSid);
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say(
+    { voice: 'Polly.Joanna' },
+    'Thank you. I have recorded your message.'
+  );
+  twiml.hangup();
+  return sendTwiml(res, twiml);
 });
 
 app.get('/health', (req, res) => {
