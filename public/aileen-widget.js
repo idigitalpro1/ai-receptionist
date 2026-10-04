@@ -1,6 +1,8 @@
 (() => {
   const script = document.currentScript;
   const endpoint = script?.dataset.endpoint || new URL('/chat', script.src).href;
+  const statusEndpoint = `${endpoint.replace(/\/+$/, '')}/status`;
+  const fallbackError = 'Aileen is unavailable. Please try again shortly.';
   const title = script?.dataset.title || 'Aileen';
   const greeting =
     script?.dataset.greeting ||
@@ -17,6 +19,7 @@
       :host { all: initial; }
       * { box-sizing: border-box; }
       button, textarea { font: inherit; }
+      .launcher[hidden] { display: none; }
       .launcher {
         position: fixed; right: 22px; bottom: 22px; z-index: 2147483000;
         border: 1px solid ${accent}; background: #171717; color: #f4f1e8;
@@ -53,7 +56,7 @@
         .panel { right: 14px; bottom: 68px; height: calc(100vh - 90px); }
       }
     </style>
-    <button class="launcher" type="button" aria-expanded="false">Ask Aileen</button>
+    <button class="launcher" type="button" aria-expanded="false" hidden>Ask Aileen</button>
     <section class="panel" role="dialog" aria-label="Chat with Aileen">
       <header>
         <div><strong>${title}</strong><span>Colorado News Press</span></div>
@@ -83,6 +86,7 @@
     item.textContent = content;
     messages.appendChild(item);
     messages.scrollTop = messages.scrollHeight;
+    return item;
   }
 
   addMessage('assistant', greeting);
@@ -97,16 +101,31 @@
   launcher.addEventListener('click', () => setOpen(!panel.classList.contains('open')));
   close.addEventListener('click', () => setOpen(false));
 
+  // A failed status check still shows the button; /chat reports any real outage.
+  fetch(statusEndpoint, { cache: 'no-store' })
+    .then((response) => (response.ok ? response.json() : { enabled: true }))
+    .catch(() => ({ enabled: true }))
+    .then((data) => {
+      launcher.hidden = data?.enabled === false;
+    });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const message = input.value.trim();
     if (!message || send.disabled) return;
 
-    addMessage('user', message);
+    const sent = addMessage('user', message);
     history.push({ role: 'user', content: message });
     input.value = '';
     send.disabled = true;
     status.textContent = 'Aileen is responding…';
+
+    function restoreUnsent(errorText) {
+      status.textContent = errorText;
+      sent.remove();
+      history.pop();
+      if (!input.value) input.value = message;
+    }
 
     try {
       const response = await fetch(endpoint, {
@@ -114,13 +133,17 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message, history: history.slice(-12) })
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Chat unavailable');
+      const data = await response.json().catch(() => null);
+      if (!response.ok || typeof data?.reply !== 'string') {
+        if (data?.code === 'chat_disabled') launcher.hidden = true;
+        restoreUnsent(typeof data?.error === 'string' ? data.error : fallbackError);
+        return;
+      }
       addMessage('assistant', data.reply);
       history.push({ role: 'assistant', content: data.reply });
       status.textContent = '';
     } catch {
-      status.textContent = 'Aileen is unavailable. Please try again shortly.';
+      restoreUnsent(fallbackError);
     } finally {
       send.disabled = false;
       input.focus();

@@ -10,6 +10,8 @@ services:
       - PORT=${PORT:-8787}
       - HOST=${HOST:-0.0.0.0}
       - SIP_DOMAIN=${SIP_DOMAIN:-1722.3cx.cloud}
+    volumes:
+      - ./data:/app/data
     logging:
       driver: json-file
       options:
