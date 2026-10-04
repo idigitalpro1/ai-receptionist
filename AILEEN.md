@@ -41,6 +41,45 @@ CHAT_RATE_WINDOW_MS=60000
 MESSAGE_DELIVERY_ENABLED=false
 ```
 
+## Remote on/off toggle
+
+Aileen chat can be turned on or off at any time without redeploying, using a
+protected admin endpoint. Set an admin token:
+
+```dotenv
+ADMIN_TOKEN=some-long-random-secret
+```
+
+Optional starting state (defaults to enabled; overridden by the last toggle
+call once one has been made):
+
+```dotenv
+AILEEN_CHAT_ENABLED=true
+```
+
+Check current status:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://YOUR-RECEPTIONIST-HOST/admin/aileen
+```
+
+Turn off / on:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"enabled": false}' https://YOUR-RECEPTIONIST-HOST/admin/aileen
+
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"enabled": true}' https://YOUR-RECEPTIONIST-HOST/admin/aileen
+```
+
+While disabled, `/chat` returns HTTP 503 with a clear message and the widget
+surfaces it to visitors instead of calling any AI provider. The toggle state
+is written to `data/aileen-state.json` (mounted as a volume in
+`docker-compose.yml`) so it survives container restarts and redeploys.
+Without `ADMIN_TOKEN` configured, the admin endpoint is disabled (HTTP 501).
+`/health` also reports the current state as `aileenChatEnabled`.
+
 ## Test page
 
 Open `/aileen-demo` on the deployed receptionist service.

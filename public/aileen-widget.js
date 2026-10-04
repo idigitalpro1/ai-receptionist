@@ -119,8 +119,8 @@
       addMessage('assistant', data.reply);
       history.push({ role: 'assistant', content: data.reply });
       status.textContent = '';
-    } catch {
-      status.textContent = 'Aileen is unavailable. Please try again shortly.';
+    } catch (error) {
+      status.textContent = error.message || 'Aileen is unavailable. Please try again shortly.';
     } finally {
       send.disabled = false;
       input.focus();

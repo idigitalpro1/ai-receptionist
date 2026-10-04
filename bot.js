@@ -39,6 +39,52 @@ const PATRICK_IPHONE_NUMBER = '+17204533534';
 const IPHONE_SPEECH_RE = /\b(100|one hundred|extension\s*100)\b/i;
 const chatRateBuckets = new Map();
 const voicemailDrafts = new Map();
+const ADMIN_TOKEN = String(process.env.ADMIN_TOKEN || '').trim();
+const DATA_DIR = path.join(__dirname, 'data');
+const STATE_FILE_PATH = path.join(DATA_DIR, 'aileen-state.json');
+
+function loadAileenEnabledState() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(STATE_FILE_PATH, 'utf8'));
+    if (typeof saved.aileenEnabled === 'boolean') return saved.aileenEnabled;
+  } catch {
+    // No saved state yet; fall back to the env default below.
+  }
+  return process.env.AILEEN_CHAT_ENABLED !== 'false';
+}
+
+let aileenEnabled = loadAileenEnabledState();
+
+function saveAileenEnabledState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE_PATH, JSON.stringify({ aileenEnabled }), 'utf8');
+  } catch (error) {
+    console.error(`[admin] failed to persist Aileen toggle state: ${error.message}`);
+  }
+}
+
+function isAuthorizedAdmin(req) {
+  if (!ADMIN_TOKEN) return false;
+  const header = String(req.get('authorization') || '');
+  const provided = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!provided) return false;
+
+  const expected = Buffer.from(ADMIN_TOKEN);
+  const actual = Buffer.from(provided);
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(501).json({ error: 'Admin control is not configured on this server.' });
+  }
+  if (!isAuthorizedAdmin(req)) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+  next();
+}
 
 const AILEEN_SYSTEM_PROMPT = `You are Aileen, the intelligent front door to Colorado News Press and its network of community publications, including the Weekly Register-Call, Colorado's oldest continuously published newspaper.
 
@@ -539,6 +585,12 @@ app.post('/chat', async (req, res) => {
   if (!isAllowedChatOrigin(req)) {
     return res.status(403).json({ error: 'This site is not authorized to use Aileen.' });
   }
+  if (!aileenEnabled) {
+    return res.status(503).json({
+      error: 'Aileen chat is currently turned off. Please try again later.',
+      requestId
+    });
+  }
   if (!isWithinChatRateLimit(req)) {
     return res.status(429).json({
       error: 'Aileen has received too many requests. Please wait a moment and try again.',
@@ -568,6 +620,22 @@ app.post('/chat', async (req, res) => {
       requestId
     });
   }
+});
+
+app.get('/admin/aileen', requireAdmin, (_req, res) => {
+  res.json({ enabled: aileenEnabled });
+});
+
+app.post('/admin/aileen', requireAdmin, (req, res) => {
+  const { enabled } = req.body || {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: '"enabled" must be true or false.' });
+  }
+
+  aileenEnabled = enabled;
+  saveAileenEnabledState();
+  console.log(`[admin] Aileen chat ${aileenEnabled ? 'enabled' : 'disabled'} remotely`);
+  res.json({ enabled: aileenEnabled });
 });
 
 app.get('/aileen-demo', (_req, res) => {
@@ -655,6 +723,7 @@ app.get('/health', (req, res) => {
       process.env.GEMINI_API_KEY ||
       process.env.ANTHROPIC_API_KEY
     ),
+    aileenChatEnabled: aileenEnabled,
     messageDeliveryEnabled: MESSAGE_DELIVERY_ENABLED,
     time: new Date().toISOString()
   });
