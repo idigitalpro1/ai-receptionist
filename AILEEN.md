@@ -50,12 +50,21 @@ protected admin endpoint. Set an admin token:
 ADMIN_TOKEN=some-long-random-secret
 ```
 
-Optional starting state (defaults to enabled; overridden by the last toggle
-call once one has been made):
+Optional starting state. Chat is enabled unless this is `false`, `0`, `off` or
+`no` (any capitalization):
 
 ```dotenv
 AILEEN_CHAT_ENABLED=true
 ```
+
+`AILEEN_CHAT_ENABLED` only applies until the first toggle call. After that,
+the saved state in `data/aileen-state.json` always wins, including across
+redeploys, so changing the env var alone will not change it. Use the admin
+endpoint, or delete `data/aileen-state.json` on the server to fall back to the
+env var.
+
+Admin requests are limited to 10 per minute per IP (`ADMIN_RATE_LIMIT`,
+`ADMIN_RATE_WINDOW_MS`).
 
 Check current status:
 
@@ -73,12 +82,16 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: applicati
   -d '{"enabled": true}' https://YOUR-RECEPTIONIST-HOST/admin/aileen
 ```
 
-While disabled, `/chat` returns HTTP 503 with a clear message and the widget
-surfaces it to visitors instead of calling any AI provider. The toggle state
-is written to `data/aileen-state.json` (mounted as a volume in
-`docker-compose.yml`) so it survives container restarts and redeploys.
-Without `ADMIN_TOKEN` configured, the admin endpoint is disabled (HTTP 501).
-`/health` also reports the current state as `aileenChatEnabled`.
+While disabled, the widget hides its "Ask Aileen" button (it checks the
+public `GET /chat/status` on page load), and `/chat` returns HTTP 503 without
+calling any AI provider. The toggle state is written to
+`data/aileen-state.json` (mounted as a volume in `docker-compose.yml`) so it
+survives container restarts and redeploys. If the state can't be saved, the
+toggle still takes effect immediately but the endpoint returns HTTP 500 with
+`"persisted": false`, meaning it will be lost on the next restart; check that
+`data/` on the host is writable. Without `ADMIN_TOKEN` configured, the admin
+endpoint is disabled (HTTP 501). `/health` also reports the current state as
+`aileenChatEnabled`.
 
 ## Test page
 

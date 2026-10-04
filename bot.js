@@ -38,47 +38,91 @@ const MESSAGE_DELIVERY_ENABLED = process.env.MESSAGE_DELIVERY_ENABLED === 'true'
 const PATRICK_IPHONE_NUMBER = '+17204533534';
 const IPHONE_SPEECH_RE = /\b(100|one hundred|extension\s*100)\b/i;
 const chatRateBuckets = new Map();
+const adminRateBuckets = new Map();
 const voicemailDrafts = new Map();
 const ADMIN_TOKEN = String(process.env.ADMIN_TOKEN || '').trim();
+const ADMIN_TOKEN_DIGEST = crypto.createHash('sha256').update(ADMIN_TOKEN).digest();
+const ADMIN_RATE_LIMIT = Number(process.env.ADMIN_RATE_LIMIT || 10);
+const ADMIN_RATE_WINDOW_MS = Number(process.env.ADMIN_RATE_WINDOW_MS || 60_000);
 const DATA_DIR = path.join(__dirname, 'data');
 const STATE_FILE_PATH = path.join(DATA_DIR, 'aileen-state.json');
+const FALSE_VALUES = new Set(['false', '0', 'off', 'no']);
+
+function isEnvEnabled(value) {
+  return !FALSE_VALUES.has(String(value ?? '').trim().toLowerCase());
+}
 
 function loadAileenEnabledState() {
+  const envDefault = isEnvEnabled(process.env.AILEEN_CHAT_ENABLED);
+  let raw;
   try {
-    const saved = JSON.parse(fs.readFileSync(STATE_FILE_PATH, 'utf8'));
-    if (typeof saved.aileenEnabled === 'boolean') return saved.aileenEnabled;
-  } catch {
-    // No saved state yet; fall back to the env default below.
+    raw = fs.readFileSync(STATE_FILE_PATH, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error(`[admin] cannot read ${STATE_FILE_PATH}: ${error.message}; using AILEEN_CHAT_ENABLED=${envDefault}`);
+    }
+    return envDefault;
   }
-  return process.env.AILEEN_CHAT_ENABLED !== 'false';
+
+  try {
+    const saved = JSON.parse(raw);
+    if (typeof saved.aileenEnabled === 'boolean') return saved.aileenEnabled;
+    throw new Error('missing boolean "aileenEnabled"');
+  } catch (error) {
+    console.error(`[admin] invalid ${STATE_FILE_PATH}: ${error.message}; using AILEEN_CHAT_ENABLED=${envDefault}`);
+    return envDefault;
+  }
 }
 
 let aileenEnabled = loadAileenEnabledState();
+console.log(`[admin] Aileen chat starts ${aileenEnabled ? 'enabled' : 'disabled'}`);
 
 function saveAileenEnabledState() {
+  const tempPath = `${STATE_FILE_PATH}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(STATE_FILE_PATH, JSON.stringify({ aileenEnabled }), 'utf8');
+    fs.writeFileSync(tempPath, JSON.stringify({ aileenEnabled }), 'utf8');
+    fs.renameSync(tempPath, STATE_FILE_PATH);
+    return true;
   } catch (error) {
     console.error(`[admin] failed to persist Aileen toggle state: ${error.message}`);
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Nothing to clean up if the folder itself is unusable.
+    }
+    return false;
   }
 }
 
-function isAuthorizedAdmin(req) {
-  if (!ADMIN_TOKEN) return false;
-  const header = String(req.get('authorization') || '');
-  const provided = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!provided) return false;
+function isWithinRateLimit(buckets, req, limit, windowMs) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const bucket = buckets.get(key);
 
-  const expected = Buffer.from(ADMIN_TOKEN);
-  const actual = Buffer.from(provided);
-  if (expected.length !== actual.length) return false;
-  return crypto.timingSafeEqual(expected, actual);
+  if (!bucket || now >= bucket.resetAt) {
+    buckets.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+
+  bucket.count += 1;
+  return bucket.count <= limit;
+}
+
+function isAuthorizedAdmin(req) {
+  const match = String(req.get('authorization') || '').match(/^Bearer\s+(\S+)\s*$/i);
+  if (!match) return false;
+  // Hashing both sides gives equal-length buffers, so the comparison leaks nothing about token length.
+  const provided = crypto.createHash('sha256').update(match[1]).digest();
+  return crypto.timingSafeEqual(ADMIN_TOKEN_DIGEST, provided);
 }
 
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
     return res.status(501).json({ error: 'Admin control is not configured on this server.' });
+  }
+  if (!isWithinRateLimit(adminRateBuckets, req, ADMIN_RATE_LIMIT, ADMIN_RATE_WINDOW_MS)) {
+    return res.status(429).json({ error: 'Too many admin requests. Please wait a minute.' });
   }
   if (!isAuthorizedAdmin(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
@@ -151,17 +195,7 @@ function normalizeChatHistory(history) {
 }
 
 function isWithinChatRateLimit(req) {
-  const now = Date.now();
-  const key = req.ip || req.socket.remoteAddress || 'unknown';
-  const bucket = chatRateBuckets.get(key);
-
-  if (!bucket || now >= bucket.resetAt) {
-    chatRateBuckets.set(key, { count: 1, resetAt: now + CHAT_RATE_WINDOW_MS });
-    return true;
-  }
-
-  bucket.count += 1;
-  return bucket.count <= CHAT_RATE_LIMIT;
+  return isWithinRateLimit(chatRateBuckets, req, CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_MS);
 }
 
 async function createAileenReply(history) {
@@ -578,6 +612,13 @@ app.options('/chat', (req, res) => {
   return res.sendStatus(204);
 });
 
+app.get('/chat/status', (req, res) => {
+  if (!isAllowedChatOrigin(req)) return res.sendStatus(403);
+  setChatCors(req, res);
+  res.set('Cache-Control', 'no-store');
+  return res.json({ enabled: aileenEnabled });
+});
+
 app.post('/chat', async (req, res) => {
   const requestId = crypto.randomUUID();
   setChatCors(req, res);
@@ -588,6 +629,7 @@ app.post('/chat', async (req, res) => {
   if (!aileenEnabled) {
     return res.status(503).json({
       error: 'Aileen chat is currently turned off. Please try again later.',
+      code: 'chat_disabled',
       requestId
     });
   }
@@ -633,9 +675,16 @@ app.post('/admin/aileen', requireAdmin, (req, res) => {
   }
 
   aileenEnabled = enabled;
-  saveAileenEnabledState();
-  console.log(`[admin] Aileen chat ${aileenEnabled ? 'enabled' : 'disabled'} remotely`);
-  res.json({ enabled: aileenEnabled });
+  const persisted = saveAileenEnabledState();
+  console.log(`[admin] Aileen chat ${aileenEnabled ? 'enabled' : 'disabled'} remotely (persisted=${persisted})`);
+  if (!persisted) {
+    return res.status(500).json({
+      enabled: aileenEnabled,
+      persisted: false,
+      error: 'The change is active now but could not be saved, so it will be lost on restart. Check that the data/ folder is writable.'
+    });
+  }
+  res.json({ enabled: aileenEnabled, persisted: true });
 });
 
 app.get('/aileen-demo', (_req, res) => {
